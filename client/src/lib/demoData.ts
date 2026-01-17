@@ -37,7 +37,7 @@ export const DEMO_CUSTOMERS = [
   {
     id: 'cust1',
     name: 'สมชาย ชาวไร่',
-    phone: '0812345678',
+    phone: '0812345699',
     address: 'บ้านเลขที่ 123 หมู่ 1 ต.ท่าม่วง อ.เมืองชัยภูมิ จ.ชัยภูมิ',
     debt: 0,
     createdAt: new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString(),
