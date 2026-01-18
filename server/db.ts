@@ -1,31 +1,87 @@
-import { eq, and, desc, gte, lte } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/mysql2";
-import { 
-  InsertUser, users, 
-  shops, InsertShop,
-  products, InsertProduct,
-  customers, InsertCustomer,
-  sales, InsertSale,
-  saleItems, InsertSaleItem,
-  priceHistory, InsertPriceHistory,
-  dailyClose, InsertDailyClose,
-  debtTransactions, InsertDebtTransaction
-} from "../drizzle/schema";
+import mongoose from "mongoose";
 import { ENV } from './_core/env';
+import {
+  User,
+  Shop,
+  Product,
+  Customer,
+  Sale,
+  SaleItem,
+  PriceHistory,
+  DailyClose,
+  DebtTransaction,
+  IUser,
+  IShop,
+  IProduct,
+  ICustomer,
+  ISale,
+  ISaleItem,
+  IPriceHistory,
+  IDailyClose,
+  IDebtTransaction,
+  InsertUser,
+  InsertShop,
+  InsertProduct,
+  InsertCustomer,
+  InsertSale,
+  InsertSaleItem,
+  InsertPriceHistory,
+  InsertDailyClose,
+  InsertDebtTransaction,
+} from './mongoose-schema';
 
-let _db: ReturnType<typeof drizzle> | null = null;
+let _isConnected = false;
 
-// Lazily create the drizzle instance so local tooling can run without a DB.
+// Connect to MongoDB
 export async function getDb() {
-  if (!_db && process.env.DATABASE_URL) {
+  if (!_isConnected && process.env.DATABASE_URL) {
     try {
-      _db = drizzle(process.env.DATABASE_URL);
+      await mongoose.connect(process.env.DATABASE_URL);
+      _isConnected = true;
+      console.log("[Database] Connected to MongoDB");
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
-      _db = null;
+      _isConnected = false;
     }
   }
-  return _db;
+  return _isConnected ? mongoose.connection : null;
+}
+
+// Helper to convert MongoDB ObjectId to string for compatibility
+function toId(value: mongoose.Types.ObjectId | string | number | undefined): string | undefined {
+  if (!value) return undefined;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number') return value.toString();
+  return value.toString();
+}
+
+// Helper to convert to ObjectId
+// Handles both ObjectId strings (24 hex chars) and numeric IDs (for legacy compatibility)
+function toObjectId(value: string | number | mongoose.Types.ObjectId | undefined): mongoose.Types.ObjectId | undefined {
+  if (!value) return undefined;
+  if (value instanceof mongoose.Types.ObjectId) return value;
+  if (typeof value === 'string') {
+    // Check if it's a valid ObjectId format (24 hex characters)
+    if (/^[0-9a-fA-F]{24}$/.test(value)) {
+      return new mongoose.Types.ObjectId(value);
+    }
+    // If it's not a valid ObjectId, treat as undefined (will need to handle this case)
+    return undefined;
+  }
+  if (typeof value === 'number') {
+    // For numeric IDs, we can't convert to ObjectId directly
+    // This should only happen during migration - in production all IDs should be ObjectIds
+    return undefined;
+  }
+  return undefined;
+}
+
+// Helper to convert ObjectId to string ID for API responses
+function toIdString(obj: mongoose.Types.ObjectId | string | number | undefined): string | undefined {
+  if (!obj) return undefined;
+  if (typeof obj === 'string') return obj;
+  if (typeof obj === 'number') return obj.toString();
+  return obj.toString();
 }
 
 export async function upsertUser(user: InsertUser): Promise<void> {
@@ -40,47 +96,31 @@ export async function upsertUser(user: InsertUser): Promise<void> {
   }
 
   try {
-    const values: InsertUser = {
-      openId: user.openId,
+    const updateSet: Partial<IUser> = {
+      lastSignedIn: user.lastSignedIn ?? new Date(),
     };
-    const updateSet: Record<string, unknown> = {};
 
     const textFields = ["name", "email", "loginMethod"] as const;
     type TextField = (typeof textFields)[number];
 
-    const assignNullable = (field: TextField) => {
+    textFields.forEach((field) => {
       const value = user[field];
-      if (value === undefined) return;
-      const normalized = value ?? null;
-      values[field] = normalized;
-      updateSet[field] = normalized;
-    };
+      if (value !== undefined) {
+        updateSet[field] = value ?? undefined;
+      }
+    });
 
-    textFields.forEach(assignNullable);
-
-    if (user.lastSignedIn !== undefined) {
-      values.lastSignedIn = user.lastSignedIn;
-      updateSet.lastSignedIn = user.lastSignedIn;
-    }
     if (user.role !== undefined) {
-      values.role = user.role;
       updateSet.role = user.role;
     } else if (user.openId === ENV.ownerOpenId) {
-      values.role = 'admin';
       updateSet.role = 'admin';
     }
 
-    if (!values.lastSignedIn) {
-      values.lastSignedIn = new Date();
-    }
-
-    if (Object.keys(updateSet).length === 0) {
-      updateSet.lastSignedIn = new Date();
-    }
-
-    await db.insert(users).values(values).onDuplicateKeyUpdate({
-      set: updateSet,
-    });
+    await User.findOneAndUpdate(
+      { openId: user.openId },
+      { $set: updateSet },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
   } catch (error) {
     console.error("[Database] Failed to upsert user:", error);
     throw error;
@@ -94,9 +134,15 @@ export async function getUserByOpenId(openId: string) {
     return undefined;
   }
 
-  const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
-
-  return result.length > 0 ? result[0] : undefined;
+  const user = await User.findOne({ openId });
+  if (!user) return undefined;
+  
+  // Convert to plain object with id as string for compatibility
+  const result = user.toObject();
+  return {
+    ...result,
+    id: user._id.toString(),
+  } as any;
 }
 
 // ==================== SHOP QUERIES ====================
@@ -105,23 +151,53 @@ export async function getShopByUserId(userId: number) {
   const db = await getDb();
   if (!db) return undefined;
   
-  const result = await db.select().from(shops).where(eq(shops.userId, userId)).limit(1);
-  return result.length > 0 ? result[0] : undefined;
+  // For MongoDB, userId should be stored as ObjectId
+  // If userId is a number, we need to find by ObjectId string
+  const userIdObjId = typeof userId === 'number' 
+    ? undefined 
+    : toObjectId(userId.toString());
+  
+  const shop = userIdObjId 
+    ? await Shop.findOne({ userId: userIdObjId })
+    : await Shop.findOne({ userId: userId.toString() });
+    
+  if (!shop) return undefined;
+  
+  const result = shop.toObject();
+  return {
+    ...result,
+    id: shop._id.toString(),
+    userId: toIdString(shop.userId) || userId,
+  } as any;
 }
 
 export async function createShop(shopData: InsertShop) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  const result = await db.insert(shops).values(shopData);
-  return result;
+  const userId = typeof shopData.userId === 'string' || shopData.userId instanceof mongoose.Types.ObjectId
+    ? toObjectId(shopData.userId.toString()) || shopData.userId
+    : shopData.userId;
+    
+  const shop = new Shop({
+    ...shopData,
+    userId: userId,
+  });
+  await shop.save();
+  return shop;
 }
 
 export async function updateShop(shopId: number, shopData: Partial<InsertShop>) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  return await db.update(shops).set(shopData).where(eq(shops.id, shopId));
+  const updateData: any = { ...shopData };
+  if (updateData.userId) {
+    updateData.userId = toObjectId(updateData.userId.toString());
+  }
+  
+  const shop = await Shop.findByIdAndUpdate(toObjectId(shopId.toString()), { $set: updateData }, { new: true });
+  return shop;
 }
 
 // ==================== PRODUCT QUERIES ====================
@@ -130,30 +206,54 @@ export async function getProductsByShop(shopId: number) {
   const db = await getDb();
   if (!db) return [];
   
-  return await db.select().from(products).where(eq(products.shopId, shopId));
+  const products = await Product.find({ shopId: toObjectId(shopId.toString()) });
+  return products.map(p => {
+    const obj = p.toObject();
+    return {
+      ...obj,
+      id: p._id.toString(),
+      shopId: Number(shopId),
+    };
+  }) as any[];
 }
 
 export async function getProductById(productId: number) {
   const db = await getDb();
   if (!db) return undefined;
   
-  const result = await db.select().from(products).where(eq(products.id, productId)).limit(1);
-  return result.length > 0 ? result[0] : undefined;
+  const product = await Product.findById(toObjectId(productId.toString()));
+  if (!product) return undefined;
+  
+  const result = product.toObject();
+  return {
+    ...result,
+    id: product._id.toString(),
+  } as any;
 }
 
 export async function createProduct(productData: InsertProduct) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  const result = await db.insert(products).values(productData);
-  return result;
+  const product = new Product({
+    ...productData,
+    shopId: toObjectId(productData.shopId?.toString()) || productData.shopId,
+  });
+  await product.save();
+  return product;
 }
 
 export async function updateProduct(productId: number, productData: Partial<InsertProduct>) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  return await db.update(products).set(productData).where(eq(products.id, productId));
+  const updateData: any = { ...productData };
+  if (updateData.shopId) {
+    updateData.shopId = toObjectId(updateData.shopId.toString());
+  }
+  
+  const product = await Product.findByIdAndUpdate(toObjectId(productId.toString()), { $set: updateData }, { new: true });
+  return product;
 }
 
 // ==================== CUSTOMER QUERIES ====================
@@ -162,30 +262,54 @@ export async function getCustomersByShop(shopId: number) {
   const db = await getDb();
   if (!db) return [];
   
-  return await db.select().from(customers).where(eq(customers.shopId, shopId));
+  const customers = await Customer.find({ shopId: toObjectId(shopId.toString()) });
+  return customers.map(c => {
+    const obj = c.toObject();
+    return {
+      ...obj,
+      id: c._id.toString(),
+      shopId: Number(shopId),
+    };
+  }) as any[];
 }
 
 export async function getCustomerById(customerId: number) {
   const db = await getDb();
   if (!db) return undefined;
   
-  const result = await db.select().from(customers).where(eq(customers.id, customerId)).limit(1);
-  return result.length > 0 ? result[0] : undefined;
+  const customer = await Customer.findById(toObjectId(customerId.toString()));
+  if (!customer) return undefined;
+  
+  const result = customer.toObject();
+  return {
+    ...result,
+    id: customer._id.toString(),
+  } as any;
 }
 
 export async function createCustomer(customerData: InsertCustomer) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  const result = await db.insert(customers).values(customerData);
-  return result;
+  const customer = new Customer({
+    ...customerData,
+    shopId: toObjectId(customerData.shopId?.toString()) || customerData.shopId,
+  });
+  await customer.save();
+  return customer;
 }
 
 export async function updateCustomer(customerId: number, customerData: Partial<InsertCustomer>) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  return await db.update(customers).set(customerData).where(eq(customers.id, customerId));
+  const updateData: any = { ...customerData };
+  if (updateData.shopId) {
+    updateData.shopId = toObjectId(updateData.shopId.toString());
+  }
+  
+  const customer = await Customer.findByIdAndUpdate(toObjectId(customerId.toString()), { $set: updateData }, { new: true });
+  return customer;
 }
 
 // ==================== SALES QUERIES ====================
@@ -194,33 +318,63 @@ export async function getSalesByShop(shopId: number, limit = 100) {
   const db = await getDb();
   if (!db) return [];
   
-  return await db.select().from(sales)
-    .where(eq(sales.shopId, shopId))
-    .orderBy(desc(sales.saleDate))
+  const sales = await Sale.find({ shopId: toObjectId(shopId.toString()) })
+    .sort({ saleDate: -1 })
     .limit(limit);
+  
+  return sales.map(s => {
+    const obj = s.toObject();
+    return {
+      ...obj,
+      id: s._id.toString(),
+      shopId: Number(shopId),
+      customerId: s.customerId ? Number(s.customerId) : undefined,
+    };
+  }) as any[];
 }
 
 export async function getSaleById(saleId: number) {
   const db = await getDb();
   if (!db) return undefined;
   
-  const result = await db.select().from(sales).where(eq(sales.id, saleId)).limit(1);
-  return result.length > 0 ? result[0] : undefined;
+  const sale = await Sale.findById(toObjectId(saleId.toString()));
+  if (!sale) return undefined;
+  
+  const result = sale.toObject();
+  return {
+    ...result,
+    id: sale._id.toString(),
+    customerId: sale.customerId ? Number(sale.customerId) : undefined,
+  } as any;
 }
 
 export async function createSale(saleData: InsertSale) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  const result = await db.insert(sales).values(saleData);
-  return result;
+  const sale = new Sale({
+    ...saleData,
+    shopId: toObjectId(saleData.shopId?.toString()) || saleData.shopId,
+    customerId: saleData.customerId ? toObjectId(saleData.customerId.toString()) : undefined,
+  });
+  await sale.save();
+  return sale;
 }
 
 export async function updateSale(saleId: number, saleData: Partial<InsertSale>) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  return await db.update(sales).set(saleData).where(eq(sales.id, saleId));
+  const updateData: any = { ...saleData };
+  if (updateData.shopId) {
+    updateData.shopId = toObjectId(updateData.shopId.toString());
+  }
+  if (updateData.customerId !== undefined) {
+    updateData.customerId = updateData.customerId ? toObjectId(updateData.customerId.toString()) : undefined;
+  }
+  
+  const sale = await Sale.findByIdAndUpdate(toObjectId(saleId.toString()), { $set: updateData }, { new: true });
+  return sale;
 }
 
 // ==================== SALE ITEMS QUERIES ====================
@@ -229,15 +383,29 @@ export async function getSaleItems(saleId: number) {
   const db = await getDb();
   if (!db) return [];
   
-  return await db.select().from(saleItems).where(eq(saleItems.saleId, saleId));
+  const items = await SaleItem.find({ saleId: toObjectId(saleId.toString()) });
+  return items.map(item => {
+    const obj = item.toObject();
+    return {
+      ...obj,
+      id: item._id.toString(),
+      saleId: Number(saleId),
+      productId: Number(item.productId),
+    };
+  }) as any[];
 }
 
 export async function createSaleItem(saleItemData: InsertSaleItem) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  const result = await db.insert(saleItems).values(saleItemData);
-  return result;
+  const item = new SaleItem({
+    ...saleItemData,
+    saleId: toObjectId(saleItemData.saleId?.toString()) || saleItemData.saleId,
+    productId: toObjectId(saleItemData.productId?.toString()) || saleItemData.productId,
+  });
+  await item.save();
+  return item;
 }
 
 // ==================== PRICE HISTORY QUERIES ====================
@@ -246,18 +414,32 @@ export async function getPriceHistory(productId: number, limit = 50) {
   const db = await getDb();
   if (!db) return [];
   
-  return await db.select().from(priceHistory)
-    .where(eq(priceHistory.productId, productId))
-    .orderBy(desc(priceHistory.changeDate))
+  const history = await PriceHistory.find({ productId: toObjectId(productId.toString()) })
+    .sort({ changeDate: -1 })
     .limit(limit);
+  
+  return history.map(h => {
+    const obj = h.toObject();
+    return {
+      ...obj,
+      id: h._id.toString(),
+      productId: Number(productId),
+      changedBy: Number(h.changedBy),
+    };
+  }) as any[];
 }
 
 export async function createPriceHistory(priceData: InsertPriceHistory) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  const result = await db.insert(priceHistory).values(priceData);
-  return result;
+  const history = new PriceHistory({
+    ...priceData,
+    productId: toObjectId(priceData.productId?.toString()) || priceData.productId,
+    changedBy: toObjectId(priceData.changedBy?.toString()) || priceData.changedBy,
+  });
+  await history.save();
+  return history;
 }
 
 // ==================== DAILY CLOSE QUERIES ====================
@@ -272,33 +454,52 @@ export async function getDailyCloseByDate(shopId: number, closeDate: Date) {
   const endOfDay = new Date(closeDate);
   endOfDay.setHours(23, 59, 59, 999);
   
-  const result = await db.select().from(dailyClose)
-    .where(and(
-      eq(dailyClose.shopId, shopId),
-      gte(dailyClose.closeDate, startOfDay),
-      lte(dailyClose.closeDate, endOfDay)
-    ))
-    .limit(1);
+  const dailyClose = await DailyClose.findOne({
+    shopId: toObjectId(shopId.toString()),
+    closeDate: { $gte: startOfDay, $lte: endOfDay },
+  });
   
-  return result.length > 0 ? result[0] : undefined;
+  if (!dailyClose) return undefined;
+  
+  const result = dailyClose.toObject();
+  return {
+    ...result,
+    id: dailyClose._id.toString(),
+    shopId: Number(shopId),
+    closedBy: Number(dailyClose.closedBy),
+  } as any;
 }
 
 export async function getDailyCloseHistory(shopId: number, limit = 30) {
   const db = await getDb();
   if (!db) return [];
   
-  return await db.select().from(dailyClose)
-    .where(eq(dailyClose.shopId, shopId))
-    .orderBy(desc(dailyClose.closeDate))
+  const history = await DailyClose.find({ shopId: toObjectId(shopId.toString()) })
+    .sort({ closeDate: -1 })
     .limit(limit);
+  
+  return history.map(h => {
+    const obj = h.toObject();
+    return {
+      ...obj,
+      id: h._id.toString(),
+      shopId: Number(shopId),
+      closedBy: Number(h.closedBy),
+    };
+  }) as any[];
 }
 
 export async function createDailyClose(closeData: InsertDailyClose) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  const result = await db.insert(dailyClose).values(closeData);
-  return result;
+  const dailyClose = new DailyClose({
+    ...closeData,
+    shopId: toObjectId(closeData.shopId?.toString()) || closeData.shopId,
+    closedBy: toObjectId(closeData.closedBy?.toString()) || closeData.closedBy,
+  });
+  await dailyClose.save();
+  return dailyClose;
 }
 
 // ==================== DEBT TRANSACTION QUERIES ====================
@@ -307,18 +508,32 @@ export async function getDebtTransactions(customerId: number, limit = 50) {
   const db = await getDb();
   if (!db) return [];
   
-  return await db.select().from(debtTransactions)
-    .where(eq(debtTransactions.customerId, customerId))
-    .orderBy(desc(debtTransactions.paymentDate))
+  const transactions = await DebtTransaction.find({ customerId: toObjectId(customerId.toString()) })
+    .sort({ paymentDate: -1 })
     .limit(limit);
+  
+  return transactions.map(t => {
+    const obj = t.toObject();
+    return {
+      ...obj,
+      id: t._id.toString(),
+      customerId: Number(customerId),
+      saleId: t.saleId ? Number(t.saleId) : undefined,
+    };
+  }) as any[];
 }
 
 export async function createDebtTransaction(debtData: InsertDebtTransaction) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   
-  const result = await db.insert(debtTransactions).values(debtData);
-  return result;
+  const transaction = new DebtTransaction({
+    ...debtData,
+    customerId: toObjectId(debtData.customerId?.toString()) || debtData.customerId,
+    saleId: debtData.saleId ? toObjectId(debtData.saleId.toString()) : undefined,
+  });
+  await transaction.save();
+  return transaction;
 }
 
 // ==================== DASHBOARD QUERIES ====================
@@ -349,32 +564,28 @@ export async function getDashboardStats(shopId: number, date: Date) {
   const endOfDay = new Date(date);
   endOfDay.setHours(23, 59, 59, 999);
   
-  const todaySales = await db.select().from(sales)
-    .where(and(
-      eq(sales.shopId, shopId),
-      gte(sales.saleDate, startOfDay),
-      lte(sales.saleDate, endOfDay)
-    ));
+  const todaySales = await Sale.find({
+    shopId: toObjectId(shopId.toString()),
+    saleDate: { $gte: startOfDay, $lte: endOfDay },
+  });
   
-  const totalSales = todaySales.reduce((sum, sale) => sum + parseFloat(sale.totalAmount.toString()), 0);
+  const totalSales = todaySales.reduce((sum, sale) => sum + (sale.totalAmount || 0), 0);
   const totalCash = todaySales.filter(s => s.paymentMethod === 'cash')
-    .reduce((sum, sale) => sum + parseFloat((sale.paidAmount ?? 0).toString()), 0);
+    .reduce((sum, sale) => sum + (sale.paidAmount || 0), 0);
   const totalCredit = todaySales.filter(s => s.paymentMethod === 'credit')
-    .reduce((sum, sale) => sum + parseFloat((sale.debtAmount ?? 0).toString()), 0);
+    .reduce((sum, sale) => sum + (sale.debtAmount || 0), 0);
   
   // Monthly stats
   const startOfMonth = new Date(date.getFullYear(), date.getMonth(), 1);
   const endOfMonth = new Date(date.getFullYear(), date.getMonth() + 1, 0);
   endOfMonth.setHours(23, 59, 59, 999);
   
-  const monthlySales = await db.select().from(sales)
-    .where(and(
-      eq(sales.shopId, shopId),
-      gte(sales.saleDate, startOfMonth),
-      lte(sales.saleDate, endOfMonth)
-    ));
+  const monthlySales = await Sale.find({
+    shopId: toObjectId(shopId.toString()),
+    saleDate: { $gte: startOfMonth, $lte: endOfMonth },
+  });
   
-  const monthlyTotal = monthlySales.reduce((sum, sale) => sum + parseFloat(sale.totalAmount.toString()), 0);
+  const monthlyTotal = monthlySales.reduce((sum, sale) => sum + (sale.totalAmount || 0), 0);
   
   return {
     todayStats: {
